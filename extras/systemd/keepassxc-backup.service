@@ -1,0 +1,6 @@
+[Unit]
+Description=Versioned backup of the KeePassXC database
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/keepassxc-backup

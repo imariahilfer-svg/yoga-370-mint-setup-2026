@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Firewall profile indicator
+Comment=Shows and switches the Home / Public firewall profile
+Exec=@HOME@/.local/bin/fwprofile-indicator
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

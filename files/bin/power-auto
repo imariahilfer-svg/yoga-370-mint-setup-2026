@@ -1,0 +1,221 @@
+#!/usr/bin/python3
+"""Panel indicator that picks a power mode automatically.
+
+  AC power              -> Maximum
+  battery, user away    -> Silent
+  battery, heavy work   -> Balanced
+A mode picked by hand stays until Auto is chosen again or AC is (un)plugged.
+"""
+import fcntl
+import os
+import sys
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("XApp", "1.0")
+from gi.repository import Gio, GLib, Gtk, XApp
+
+TICK_S = 2
+IDLE_TO_SILENT_S = 120      # no input for this long on battery -> Silent
+CALM_TO_SILENT_S = 300      # light load for this long on battery -> Silent
+HEAVY_TO_BALANCED_S = 10    # sustained load for this long -> Balanced
+CPU_HEAVY_PCT = 60
+CPU_CALM_PCT = 25
+PSI_HEAVY = {"cpu": ("some", 30.0), "io": ("full", 20.0), "memory": ("some", 10.0)}
+SILENT_MAX_PERF_PCT = 40    # only applied if the pstate files are writable
+
+MODES = {
+    "power-saver": ("Silent", "power-profile-power-saver-symbolic"),
+    "balanced": ("Balanced", "power-profile-balanced-symbolic"),
+    "performance": ("Maximum", "power-profile-performance-symbolic"),
+}
+PPD = ("org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles")
+PSTATE = "/sys/devices/system/cpu/intel_pstate/"
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+class PowerAuto:
+    def __init__(self):
+        self.ppd = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
+            PPD[0], PPD[1], PPD[0], None)
+        self.ppd.connect("g-properties-changed", self.on_ppd_changed)
+        self.idle = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+            "org.cinnamon.Muffin.IdleMonitor", "/org/cinnamon/Muffin/IdleMonitor/Core",
+            "org.cinnamon.Muffin.IdleMonitor", None)
+
+        self.auto = True
+        self.on_ac = self.read_ac()
+        self.last_set = None
+        self.cpu_prev = self.read_cpu()
+        self.heavy_s = 0
+        self.calm_s = 0
+        self.cpu_pct = 0.0
+
+        self.icon = XApp.StatusIcon()
+        self.icon.set_name("power-auto")
+        self.build_menu()
+        self.tick()
+        GLib.timeout_add_seconds(TICK_S, self.tick)
+
+    # --- inputs -----------------------------------------------------------
+    def read_ac(self):
+        return read("/sys/class/power_supply/AC/online", "1") == "1"
+
+    def read_cpu(self):
+        v = [int(x) for x in read("/proc/stat").splitlines()[0].split()[1:8]]
+        return sum(v), v[3] + v[4]
+
+    def idle_seconds(self):
+        try:
+            return self.idle.call_sync("GetIdletime", None, Gio.DBusCallFlags.NONE,
+                                       500, None).unpack()[0] / 1000
+        except GLib.Error:
+            return 0
+
+    def under_pressure(self):
+        for res, (kind, limit) in PSI_HEAVY.items():
+            for line in read("/proc/pressure/" + res).splitlines():
+                if line.startswith(kind):
+                    if float(line.split()[1].split("=")[1]) > limit:
+                        return True
+        return False
+
+    def profile(self):
+        v = self.ppd.get_cached_property("ActiveProfile")
+        return v.unpack() if v else "balanced"
+
+    # --- outputs ----------------------------------------------------------
+    def set_profile(self, name):
+        if name != self.profile():
+            self.last_set = name
+            try:
+                self.ppd.call_sync(
+                    "org.freedesktop.DBus.Properties.Set",
+                    GLib.Variant("(ssv)", (PPD[0], "ActiveProfile", GLib.Variant("s", name))),
+                    Gio.DBusCallFlags.NONE, 2000, None)
+            except GLib.Error as e:
+                print("could not set profile:", e.message, file=sys.stderr)
+        self.apply_cpu_cap(name)
+
+    def apply_cpu_cap(self, name):
+        silent = name == "power-saver"
+        for f, v in (("no_turbo", "1" if silent else "0"),
+                     ("max_perf_pct", str(SILENT_MAX_PERF_PCT) if silent else "100")):
+            if os.access(PSTATE + f, os.W_OK) and read(PSTATE + f) != v:
+                try:
+                    with open(PSTATE + f, "w") as fh:
+                        fh.write(v)
+                except OSError:
+                    pass
+
+    def on_ppd_changed(self, *_):
+        # a change we did not make (power applet, powerprofilesctl) counts as manual
+        if self.profile() != self.last_set:
+            self.auto = False
+            self.apply_cpu_cap(self.profile())
+        self.refresh()
+
+    # --- logic ------------------------------------------------------------
+    def tick(self):
+        total, idle = self.read_cpu()
+        dt, di = total - self.cpu_prev[0], idle - self.cpu_prev[1]
+        self.cpu_prev = (total, idle)
+        self.cpu_pct = 100 * (1 - di / dt) if dt > 0 else 0
+
+        ac = self.read_ac()
+        if ac != self.on_ac:
+            self.on_ac = ac
+            self.auto = True
+            self.heavy_s = self.calm_s = 0
+            if not ac:
+                self.set_profile("balanced")
+
+        if self.auto:
+            self.set_profile(self.decide())
+        self.refresh()
+        return True
+
+    def decide(self):
+        if self.on_ac:
+            return "performance"
+        current = self.profile()
+        if current == "performance":
+            current = "balanced"
+        away = self.idle_seconds()
+        heavy = self.cpu_pct > CPU_HEAVY_PCT or self.under_pressure()
+        self.heavy_s = self.heavy_s + TICK_S if heavy else 0
+        self.calm_s = self.calm_s + TICK_S if self.cpu_pct < CPU_CALM_PCT and not heavy else 0
+
+        if away >= IDLE_TO_SILENT_S:
+            return "power-saver"
+        if current == "power-saver" and self.heavy_s >= HEAVY_TO_BALANCED_S:
+            self.calm_s = 0
+            return "balanced"
+        if current == "balanced" and self.calm_s >= CALM_TO_SILENT_S:
+            return "power-saver"
+        return current
+
+    # --- panel ------------------------------------------------------------
+    def build_menu(self):
+        self.menu = Gtk.Menu()
+        self.info = Gtk.MenuItem(label="")
+        self.info.set_sensitive(False)
+        self.menu.append(self.info)
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.items = {}
+        group = None
+        for key, label in [("auto", "Automatic")] + [(k, v[0]) for k, v in MODES.items()]:
+            item = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+            group = group or item
+            item.connect("activate", self.on_pick, key)
+            self.menu.append(item)
+            self.items[key] = item
+        self.menu.show_all()
+        self.icon.set_primary_menu(self.menu)
+        self.icon.set_secondary_menu(self.menu)
+
+    def on_pick(self, item, key):
+        if not item.get_active() or self.updating:
+            return
+        self.auto = key == "auto"
+        if not self.auto:
+            self.set_profile(key)
+        self.heavy_s = self.calm_s = 0
+        self.tick()
+
+    updating = False
+
+    def refresh(self):
+        name, icon = MODES.get(self.profile(), MODES["balanced"])
+        self.icon.set_icon_name(icon)
+        self.icon.set_label(name if self.auto else name + " (manual)")
+        fan = read("/proc/acpi/ibm/fan")
+        rpm = next((l.split()[-1] for l in fan.splitlines() if l.startswith("speed")), "?")
+        temp = int(read("/sys/class/thermal/thermal_zone0/temp", "0")) // 1000
+        status = "%s · fan %s rpm · %d°C · CPU %d%%" % (
+            "AC" if self.on_ac else "battery", rpm, temp, self.cpu_pct)
+        self.icon.set_tooltip_text("Power mode: %s (%s)\n%s" % (
+            name, "automatic" if self.auto else "manual", status))
+        self.info.set_label(status)
+        self.updating = True
+        self.items["auto" if self.auto else self.profile()].set_active(True)
+        self.updating = False
+
+
+if __name__ == "__main__":
+    lock = open(os.path.join(GLib.get_user_runtime_dir(), "power-auto.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("power-auto is already running")
+    PowerAuto()
+    Gtk.main()

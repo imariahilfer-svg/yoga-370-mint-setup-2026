@@ -1,0 +1,23 @@
+#!/bin/sh
+# Versioned backup of a KeePassXC database: saves a new dated copy
+# whenever the database differs from the newest backup.
+#
+# Set the database path in ~/.config/keepassxc-backup.conf, for example:
+#   DB="$HOME/Passwords.kdbx"
+#   DEST="$HOME/Backups/KeePassXC"
+#   KEEP=200
+DB="$HOME/Passwords.kdbx"
+DEST="$HOME/Backups/KeePassXC"
+KEEP=200
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/keepassxc-backup.conf"
+[ -r "$CONF" ] && . "$CONF"
+
+[ -s "$DB" ] || exit 0
+name=$(basename "$DB" .kdbx)
+mkdir -p "$DEST"
+latest=$(ls -1t "$DEST"/"$name"-*.kdbx 2>/dev/null | head -n 1)
+if [ -n "$latest" ] && cmp -s "$DB" "$latest"; then
+    exit 0
+fi
+cp --preserve=timestamps "$DB" "$DEST/$name-$(date +%Y-%m-%d_%H%M%S).kdbx"
+ls -1t "$DEST"/"$name"-*.kdbx | tail -n +$((KEEP + 1)) | while read -r old; do rm -f -- "$old"; done

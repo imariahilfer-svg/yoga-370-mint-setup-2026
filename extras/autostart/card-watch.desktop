@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Card insert menu
+Comment=Offer health check, fake test, file manager and Raspberry Pi Imager when a card or stick is inserted
+Exec=@HOME@/.local/bin/card-watch
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

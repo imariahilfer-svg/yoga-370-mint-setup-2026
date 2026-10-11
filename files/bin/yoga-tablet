@@ -1,0 +1,266 @@
+#!/usr/bin/python3
+"""Panel indicator for the Yoga's tablet features.
+
+  Rotation lock    - freeze the orientation (read by yoga-autorotate)
+  Palm rejection   - finger touch is off while the pen is near the screen
+  Touch gestures   - Cinnamon's multi-finger gestures
+  Large interface  - bigger text and panel while folded into tablet mode
+  On-screen keyboard - Onboard runs while folded and pops up on text entry
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("XApp", "1.0")
+from gi.repository import Gio, GLib, Gtk, XApp
+
+TABLET_SWITCH = os.environ.get(
+    "YOGA_TABLET_SWITCH", "/sys/devices/platform/thinkpad_acpi/hotkey_tablet_mode")
+TOUCH = "Wacom Pen and multitouch sensor Finger touch"
+PENS = ["Wacom Pen and multitouch sensor Pen stylus",
+        "Wacom Pen and multitouch sensor Pen eraser"]
+PEN_LINGER_MS = 1200        # touch stays off this long after the pen leaves
+PEN_SILENT_MS = 4000        # ... or after the pen stops reporting anything
+
+TEXT_SCALE = 1.25
+PANEL_SCALE = 1.6
+PANEL_SIZE_KEYS = ["panel-zone-icon-sizes", "panel-zone-symbolic-icon-sizes"]
+
+RUNTIME = GLib.get_user_runtime_dir()
+ROTATION_HOLD = os.path.join(RUNTIME, "yoga-autorotate.hold")
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "yoga-tablet")
+CONFIG = os.path.join(CONFIG_DIR, "config.json")
+SAVED_UI = os.path.join(CONFIG_DIR, "saved-ui.json")
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+class YogaTablet:
+    def __init__(self):
+        self.cfg = {"palm": True, "large_ui": True, "keyboard": True}
+        self.cfg.update(load(CONFIG, {}))
+        self.cinnamon = Gio.Settings.new("org.cinnamon")
+        self.iface = Gio.Settings.new("org.cinnamon.desktop.interface")
+        self.gestures = Gio.Settings.new("org.cinnamon.gestures")
+        self.gestures.connect("changed::enabled", lambda *_: self.refresh())
+
+        self.tablet = None
+        self.osk = None
+        self.pen_near = False
+        self.linger = 0
+        self.watchers = []
+        self.updating = False
+
+        self.icon = XApp.StatusIcon()
+        self.icon.set_name("yoga-tablet")
+        self.build_menu()
+        self.set_palm(self.cfg["palm"])
+        self.tick()
+        GLib.timeout_add_seconds(1, self.tick)
+
+    # --- tablet mode / large interface -----------------------------------
+    def tick(self):
+        try:
+            with open(TABLET_SWITCH) as f:
+                tablet = f.read().strip() == "1"
+        except OSError:
+            tablet = False
+        if tablet != self.tablet:
+            self.tablet = tablet
+            self.apply_ui()
+            self.apply_keyboard()
+        return True
+
+    def apply_ui(self):
+        want_large = self.tablet and self.cfg["large_ui"]
+        saved = load(SAVED_UI, None)
+        if want_large and saved is None:
+            saved = {
+                "text": self.iface.get_double("text-scaling-factor"),
+                "height": list(self.cinnamon.get_strv("panels-height")),
+            }
+            for key in PANEL_SIZE_KEYS:
+                saved[key] = self.cinnamon.get_string(key)
+            save(SAVED_UI, saved)
+            self.iface.set_double("text-scaling-factor", saved["text"] * TEXT_SCALE)
+            self.cinnamon.set_strv("panels-height", [
+                "%s:%d" % (p.split(":")[0], round(int(p.split(":")[1]) * PANEL_SCALE))
+                for p in saved["height"]])
+            for key in PANEL_SIZE_KEYS:
+                zones = json.loads(saved[key])
+                for zone in zones:
+                    for side in ("left", "center", "right"):
+                        zone[side] = round(zone[side] * PANEL_SCALE)
+                self.cinnamon.set_string(key, json.dumps(zones))
+        elif not want_large and saved is not None:
+            self.iface.set_double("text-scaling-factor", saved["text"])
+            self.cinnamon.set_strv("panels-height", saved["height"])
+            for key in PANEL_SIZE_KEYS:
+                self.cinnamon.set_string(key, saved[key])
+            os.remove(SAVED_UI)
+        self.refresh()
+
+    # --- on-screen keyboard ----------------------------------------------
+    def apply_keyboard(self):
+        # Onboard shows itself when a text field gets focus (auto-show)
+        want = self.tablet and self.cfg["keyboard"]
+        running = self.osk is not None and self.osk.poll() is None
+        if want and not running:
+            self.osk = subprocess.Popen(["onboard"], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+        elif not want and running:
+            self.osk.terminate()
+            try:
+                self.osk.wait(3)
+            except subprocess.TimeoutExpired:
+                self.osk.kill()
+            self.osk = None
+
+    def toggle_keyboard(self, *_):
+        subprocess.Popen(["dbus-send", "--type=method_call", "--dest=org.onboard.Onboard",
+                          "/org/onboard/Onboard/Keyboard",
+                          "org.onboard.Onboard.Keyboard.ToggleVisible"])
+
+    # --- palm rejection ---------------------------------------------------
+    def set_touch(self, on):
+        subprocess.run(["xsetwacom", "--set", TOUCH, "Touch", "on" if on else "off"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def set_palm(self, on):
+        for proc, source in self.watchers:
+            GLib.source_remove(source)
+            proc.kill()
+        self.watchers = []
+        if self.linger:
+            GLib.source_remove(self.linger)
+            self.linger = 0
+        self.pen_near = False
+        self.set_touch(True)
+        if not on:
+            return
+        for pen in PENS:
+            # prints "proximity in/out" and "motion ..." lines for the pen
+            proc = subprocess.Popen(["stdbuf", "-oL", "xinput", "test", pen], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            source = GLib.io_add_watch(proc.stdout, GLib.IO_IN | GLib.IO_HUP, self.on_pen)
+            self.watchers.append((proc, source))
+
+    def on_pen(self, stream, condition):
+        data = os.read(stream.fileno(), 65536)
+        if not data:
+            return False
+        last = data.rstrip().rsplit(b"\n", 1)[-1]
+        if self.linger:
+            GLib.source_remove(self.linger)
+        # a pen that goes quiet without reporting "out" must not leave touch off
+        gone = last.startswith(b"proximity out")
+        self.linger = GLib.timeout_add(PEN_LINGER_MS if gone else PEN_SILENT_MS,
+                                       self.on_pen_gone)
+        if not self.pen_near:
+            self.pen_near = True
+            self.set_touch(False)
+        return True
+
+    def on_pen_gone(self):
+        self.linger = 0
+        self.pen_near = False
+        self.set_touch(True)
+        return False
+
+    # --- panel ------------------------------------------------------------
+    def build_menu(self):
+        self.menu = Gtk.Menu()
+        self.info = Gtk.MenuItem(label="")
+        self.info.set_sensitive(False)
+        self.menu.append(self.info)
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.items = {}
+        for key, label in [("lock", "Rotation lock"),
+                           ("palm", "Palm rejection (touch off while pen is near)"),
+                           ("gestures", "Touch gestures"),
+                           ("large_ui", "Large interface in tablet mode"),
+                           ("keyboard", "On-screen keyboard in tablet mode")]:
+            item = Gtk.CheckMenuItem(label=label)
+            item.connect("toggled", self.on_toggle, key)
+            self.menu.append(item)
+            self.items[key] = item
+        self.menu.append(Gtk.SeparatorMenuItem())
+        show = Gtk.MenuItem(label="Show / hide keyboard now")
+        show.connect("activate", self.toggle_keyboard)
+        self.menu.append(show)
+        self.show_item = show
+        self.menu.show_all()
+        self.icon.set_primary_menu(self.menu)
+        self.icon.set_secondary_menu(self.menu)
+
+    def on_toggle(self, item, key):
+        if self.updating:
+            return
+        on = item.get_active()
+        if key == "lock":
+            if on:
+                open(ROTATION_HOLD, "w").close()
+            elif os.path.exists(ROTATION_HOLD):
+                os.remove(ROTATION_HOLD)
+        elif key == "gestures":
+            self.gestures.set_boolean("enabled", on)
+        else:
+            self.cfg[key] = on
+            save(CONFIG, self.cfg)
+            if key == "palm":
+                self.set_palm(on)
+            elif key == "keyboard":
+                self.apply_keyboard()
+            else:
+                self.apply_ui()
+        self.refresh()
+
+    def refresh(self):
+        locked = os.path.exists(ROTATION_HOLD)
+        state = {"lock": locked, "palm": self.cfg["palm"],
+                 "gestures": self.gestures.get_boolean("enabled"),
+                 "large_ui": self.cfg["large_ui"], "keyboard": self.cfg["keyboard"]}
+        self.updating = True
+        for key, item in self.items.items():
+            item.set_active(state[key])
+        self.updating = False
+        mode = "Tablet mode" if self.tablet else "Laptop mode"
+        self.info.set_label(mode)
+        self.show_item.set_sensitive(bool(self.tablet and self.cfg["keyboard"]))
+        self.icon.set_icon_name("rotation-locked-symbolic" if locked else
+                                "tablet-symbolic" if self.tablet else "computer-symbolic")
+        self.icon.set_label("Locked" if locked else "")
+        self.icon.set_tooltip_text("%s\nRotation %s" % (mode, "locked" if locked else "automatic"))
+
+
+if __name__ == "__main__":
+    lock = open(os.path.join(RUNTIME, "yoga-tablet.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("yoga-tablet is already running")
+    app = YogaTablet()
+    for sig in (2, 15):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, Gtk.main_quit)
+    try:
+        Gtk.main()
+    finally:
+        app.set_palm(False)
+        app.cfg["keyboard"] = False
+        app.apply_keyboard()

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Yoga tablet indicator
+Comment=Rotation lock, palm rejection, gestures and large tablet interface
+Exec=@HOME@/.local/bin/yoga-tablet
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

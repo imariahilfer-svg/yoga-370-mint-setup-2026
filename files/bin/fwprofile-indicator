@@ -1,0 +1,117 @@
+#!/usr/bin/python3
+"""Panel indicator for the Home/Public firewall profile.
+
+Shows the state written by /usr/local/sbin/fwprofile and lets you switch.
+Changes run through pkexec, so each one asks for your fingerprint or password.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("XApp", "1.0")
+from gi.repository import GLib, Gtk, XApp
+
+HELPER = "/usr/local/sbin/fwprofile"
+STATE_FILE = "/run/fwprofile/state.json"
+LOOK = {
+    "home": ("Home", "user-home-symbolic"),
+    "public": ("Public", "changes-prevent-symbolic"),
+    None: ("Firewall ?", "dialog-question-symbolic"),
+}
+
+
+class Indicator:
+    def __init__(self):
+        self.state = None
+        self.stamp = None
+        self.updating = False
+        self.icon = XApp.StatusIcon()
+        self.icon.set_name("fwprofile")
+        self.build_menu()
+        self.tick()
+        GLib.timeout_add_seconds(2, self.tick)
+
+    def build_menu(self):
+        self.menu = Gtk.Menu()
+        self.info = Gtk.MenuItem(label="")
+        self.info.set_sensitive(False)
+        self.menu.append(self.info)
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.modes = {}
+        group = None
+        for key, label in [("auto", "Automatic (by network)"),
+                           ("home", "Home: allow phone connection here, until the network changes"),
+                           ("public", "Public: block, until the network changes")]:
+            item = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+            group = group or item
+            item.connect("activate", self.on_mode, key)
+            self.menu.append(item)
+            self.modes[key] = item
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.mark = Gtk.CheckMenuItem(label="This network is a home network")
+        self.mark.connect("toggled", self.on_mark)
+        self.menu.append(self.mark)
+        self.menu.show_all()
+        self.icon.set_primary_menu(self.menu)
+        self.icon.set_secondary_menu(self.menu)
+
+    def helper(self, *args):
+        subprocess.Popen(["pkexec", HELPER, *args])
+
+    def on_mode(self, item, key):
+        if item.get_active() and not self.updating:
+            self.helper("set", key)
+
+    def on_mark(self, item):
+        if not self.updating:
+            self.helper("mark-home" if item.get_active() else "unmark-home")
+
+    def tick(self):
+        try:
+            stamp = os.stat(STATE_FILE).st_mtime
+            if stamp != self.stamp:
+                with open(STATE_FILE) as f:
+                    self.state = json.load(f)
+                self.stamp = stamp
+        except (OSError, ValueError):
+            self.state, self.stamp = None, None
+        self.refresh()
+        return True
+
+    def refresh(self):
+        state = self.state or {}
+        name, icon = LOOK[state.get("profile")]
+        mode = state.get("mode", "auto")
+        nets = state.get("networks", [])
+        self.icon.set_icon_name(icon)
+        self.icon.set_label(name if mode == "auto" else name + " (manual)")
+        if not self.state:
+            lines = ["Firewall profiles are not installed or have not run yet"]
+        elif not nets:
+            lines = ["No network"]
+        else:
+            lines = ["%s: %s" % (n["name"], "phone connection allowed" if n["open"] else
+                                 "blocked" + (" (marked home, but different router)"
+                                              if n["marked"] and not n["home"] else ""))
+                     for n in nets]
+        self.info.set_label("\n".join(lines))
+        self.icon.set_tooltip_text("Firewall profile: %s\n%s" % (name, "\n".join(lines)))
+        self.updating = True
+        self.modes.get(mode, self.modes["auto"]).set_active(True)
+        self.mark.set_active(bool(nets) and all(n["marked"] for n in nets))
+        self.mark.set_sensitive(bool(nets))
+        self.updating = False
+
+
+if __name__ == "__main__":
+    lock = open(os.path.join(GLib.get_user_runtime_dir(), "fwprofile-indicator.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("fwprofile-indicator is already running")
+    Indicator()
+    Gtk.main()

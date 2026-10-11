@@ -1,0 +1,173 @@
+#!/bin/bash
+# Menu for a freshly inserted SD card / USB stick.
+#   card-menu /dev/mmcblk0          show the menu (started by card-watch)
+#   card-menu do ACTION /dev/DEVICE   run one menu action (used by the panel applet)
+#   card-menu --health|--probe|--long DEV    run one test (inside a terminal)
+set -u
+
+IMAGER="flatpak run org.raspberrypi.rpi-imager"
+
+pause() { echo; read -rp "Press Enter to close..." _; }
+
+sysattr() { cat "/sys/block/$(basename "$DEV")/device/$1" 2>/dev/null; }
+
+partitions() { lsblk -lnpo NAME,TYPE "$DEV" | awk '$2=="part"{print $1}'; }
+
+mountpoints() { lsblk -lnpo MOUNTPOINT "$DEV" | grep -v '^$'; }
+
+unmount_all() {
+    local p
+    for p in $(lsblk -lnpo NAME "$DEV"); do
+        findmnt -n "$p" >/dev/null && udisksctl unmount -b "$p"
+    done
+}
+
+# Mount whatever is mountable, print the first mountpoint.
+mount_first() {
+    local p
+    [ -z "$(mountpoints)" ] && for p in $(partitions) "$DEV"; do
+        udisksctl mount -b "$p" >/dev/null 2>&1
+    done
+    mountpoints | head -1
+}
+
+describe() {
+    local size model
+    size=$(lsblk -dno SIZE "$DEV" | tr -d ' ')
+    model=$(lsblk -dno VENDOR,MODEL "$DEV" | xargs)
+    [ -n "$model" ] || model=$(sysattr name)
+    echo "$DEV   $size   ${model:-unknown}"
+}
+
+# --- (a) health check: read-only, nothing is written -----------------------
+health() {
+    local bad=0 name sectors off p pattern
+    name=$(basename "$DEV")
+    echo "=== Health check for $(describe) (read-only) ==="
+    echo
+    echo "--- Identity"
+    if [ -e "/sys/block/$name/device/manfid" ]; then
+        echo "Name: $(sysattr name)   Manufacturer ID: $(sysattr manfid)   OEM ID: $(sysattr oemid)"
+        echo "Made: $(sysattr date)   Serial: $(sysattr serial)"
+        if [ "$(sysattr manfid)" = "0x000000" ]; then
+            echo "!! Blank manufacturer ID: no-name or counterfeit card"; bad=1
+        fi
+    else
+        lsblk -dno VENDOR,MODEL,SERIAL,TRAN "$DEV"
+    fi
+    if [ "$(cat "/sys/block/$name/ro")" = 1 ]; then
+        echo "!! Device reports itself as read-only"; bad=1
+    fi
+    echo
+    echo "--- Partitions"
+    lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$DEV"
+    echo
+    echo "--- Read test (16 MB at start, middle and end)"
+    sectors=$(cat "/sys/block/$name/size")
+    for off in 0 $((sectors / 2 / 2048)) $((sectors / 2048 - 17)); do
+        if sudo dd if="$DEV" of=/dev/null bs=1M skip="$off" count=16 iflag=direct 2>/dev/null; then
+            echo "ok   at ${off} MB"
+        else
+            echo "!! read error at ${off} MB"; bad=1
+        fi
+    done
+    echo
+    echo "--- Filesystem check (no repairs)"
+    for p in $(partitions); do
+        case $(lsblk -dno FSTYPE "$p") in
+            ext[234]|vfat|exfat|ntfs)
+                echo "# $p"
+                sudo fsck -n "$p" 2>&1 | tail -4
+                [ "${PIPESTATUS[0]}" -ge 4 ] && { echo "!! filesystem errors on $p"; bad=1; }
+                ;;
+        esac
+    done
+    echo
+    echo "--- Kernel messages about this device"
+    pattern=$name
+    case $name in mmcblk*) pattern="$name|mmc[0-9]" ;; esac
+    if journalctl -k -b --no-pager | grep -E "$pattern" | grep -iE 'error|fail' | tail -5 | grep .; then
+        bad=1
+    else
+        echo "none"
+    fi
+    echo
+    if [ "$bad" = 0 ]; then
+        echo "RESULT: no problems found. (This does not test writing or real capacity.)"
+    else
+        echo "RESULT: problems found, see the !! lines and kernel messages above."
+    fi
+}
+
+# --- (b) quick fake test: erases the card ----------------------------------
+probe() {
+    echo "=== Quick fake test for $(describe) - ERASES THE CARD ==="
+    unmount_all
+    sudo f3probe --destructive --time-ops "$DEV"
+}
+
+# --- (c) long fake test: fills the free space, keeps existing files --------
+long() {
+    local mp
+    echo "=== Long fake test for $(describe) (keeps existing files) ==="
+    mp=$(mount_first)
+    if [ -z "$mp" ]; then
+        echo "No mountable filesystem on $DEV. Format it first, or use the quick test."
+        return
+    fi
+    echo "Using $mp"
+    f3write "$mp" && f3read "$mp"
+    rm -f "$mp"/*.h2w
+    echo "Test files removed."
+}
+
+in_terminal() { x-terminal-emulator -e "$0" "$1" "$DEV"; }
+
+# Run one menu action. Returns 1 when the menu should close.
+act() {
+    local mp
+    case $1 in
+        health|long) in_terminal "--$1" ;;
+        probe)
+            zenity --question --title="Erase card?" --default-cancel --width=420 \
+                --text="The quick fake test erases <b>everything</b> on\n$(describe)\n\nContinue?" 2>/dev/null \
+                && in_terminal --probe ;;
+        open)
+            mp=$(mount_first)
+            if [ -n "$mp" ]; then xdg-open "$mp"
+            else zenity --error --width=320 --text="Nothing on $DEV could be mounted." 2>/dev/null; fi ;;
+        imager) $IMAGER >/dev/null 2>&1 & return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+menu() {
+    local choice
+    while [ -b "$DEV" ]; do
+        choice=$(zenity --list --title="Card inserted" --width=560 --height=330 \
+            --text="<b>$(describe)</b>" --hide-header --hide-column=1 --print-column=1 \
+            --column=id --column=Action --ok-label="Run" --cancel-label="Quit" \
+            health "Health check (quick, read-only)" \
+            probe  "Fake test, quick (minutes, ERASES the card)" \
+            long   "Fake test, long (hours, keeps files)" \
+            open   "Open in file manager" \
+            imager "Open Raspberry Pi Imager" 2>/dev/null) || break
+        act "$choice" || break
+    done
+}
+
+# Accept a partition (/dev/mmcblk0p1, /dev/sdb1) and work on its whole disk.
+whole_disk() {
+    local parent
+    parent=$(lsblk -dno PKNAME "$1" 2>/dev/null)
+    if [ -n "$parent" ]; then echo "/dev/$parent"; else echo "$1"; fi
+}
+
+case "${1:-}" in
+    --health) DEV=$2; health; pause ;;
+    --probe)  DEV=$2; probe;  pause ;;
+    --long)   DEV=$2; long;   pause ;;
+    do)       DEV=$(whole_disk "$3"); act "$2" ;;
+    /dev/*)   DEV=$(whole_disk "$1"); menu ;;
+    *) echo "usage: card-menu /dev/DEVICE | card-menu do health|probe|long|open|imager /dev/DEVICE"; exit 1 ;;
+esac

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Yoga auto-rotate
+Comment=Rotate screen, touch and pen in tablet mode
+Exec=@HOME@/.local/bin/yoga-autorotate
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

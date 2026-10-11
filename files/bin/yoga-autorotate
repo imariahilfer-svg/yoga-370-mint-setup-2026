@@ -1,0 +1,55 @@
+#!/bin/bash
+# Auto-rotate the ThinkPad Yoga 370 screen while in tablet mode.
+# Laptop mode always returns to landscape.
+
+OUTPUT="eDP-1"
+TABLET_SWITCH="/sys/devices/platform/thinkpad_acpi/hotkey_tablet_mode"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/yoga-autorotate"
+LOG="$STATE.sensor"
+
+exec 9>"$STATE.lock"
+flock -n 9 || { echo "yoga-autorotate is already running" >&2; exit 0; }
+
+# monitor-sensor keeps the accelerometer claimed for as long as it runs
+monitor-sensor --accel >"$LOG" 2>&1 &
+SENSOR_PID=$!
+trap 'kill $SENSOR_PID 2>/dev/null; rm -f "$LOG"' EXIT
+trap 'exit 0' INT TERM
+
+rotate() {
+    local xr
+    case "$1" in
+        left-up)   xr=left ;;
+        right-up)  xr=right ;;
+        bottom-up) xr=inverted ;;
+        *)         xr=normal ;;
+    esac
+    # Cinnamon remaps touch and pen to the rotated screen on its own
+    xrandr --output "$OUTPUT" --rotate "$xr"
+}
+
+# Per-machine pen calibration: one line "x1 y1 x2 y2" from xinput_calibrator
+PEN_AREA_FILE="$HOME/.config/yoga-tablet/pen-area"
+if [ -r "$PEN_AREA_FILE" ]; then
+    read -r x1 y1 x2 y2 < "$PEN_AREA_FILE"
+    for tool in stylus eraser; do
+        xsetwacom --set "Wacom Pen and multitouch sensor Pen $tool" Area "$x1" "$y1" "$x2" "$y2"
+    done
+fi
+
+current=""
+while kill -0 $SENSOR_PID 2>/dev/null; do
+    if [ "$(cat "$TABLET_SWITCH" 2>/dev/null)" = "1" ]; then
+        want=$(grep -oE 'orientation(: | changed: )[a-z-]+' "$LOG" | tail -n1 | awk '{print $NF}')
+        # "undefined" means the device is lying flat: keep what we have
+        [ -z "$want" ] || [ "$want" = "undefined" ] && want="${current:-normal}"
+        # rotation lock, toggled from the yoga-tablet panel indicator
+        [ -e "$STATE.hold" ] && want="${current:-normal}"
+    else
+        want="normal"
+    fi
+    if [ "$want" != "$current" ]; then
+        rotate "$want" && current="$want"
+    fi
+    sleep 1
+done

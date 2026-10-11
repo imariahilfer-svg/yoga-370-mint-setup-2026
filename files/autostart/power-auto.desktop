@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Power mode indicator
+Comment=Automatic Silent / Balanced / Maximum power modes
+Exec=@HOME@/.local/bin/power-auto
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

@@ -1,0 +1,40 @@
+[/]
+custom-list=['__dummy__', 'custom0', 'custom1', 'custom2', 'custom3', 'custom4']
+looking-glass-keybinding=['<Control><Super>l']
+show-desklets=['<Control><Super>s']
+
+[custom-keybindings/custom0]
+binding=['<Super>i']
+command='cinnamon-settings'
+name='Settings'
+
+[custom-keybindings/custom1]
+binding=['<Control><Shift>Escape']
+command='gnome-system-monitor'
+name='Task manager'
+
+[custom-keybindings/custom2]
+binding=['<Super>k']
+command='gnome-network-displays'
+name='Cast to wireless display'
+
+[custom-keybindings/custom3]
+binding=['<Super>f', '<Super>s']
+command='catfish'
+name='Find files'
+
+[custom-keybindings/custom4]
+binding=['<Super>v']
+command='copyq toggle'
+name='Clipboard history'
+
+[media-keys]
+area-screenshot-clip=['<Control><Shift>Print', '<Super><Shift>s']
+screensaver=['<Super>l', '<Control><Alt>l', 'XF86ScreenSaver']
+
+[wm]
+panel-run-dialog=['<Alt>F2', '<Super>r']
+show-desktop=['<Super>d', '<Super>m']
+switch-to-workspace-down=['<Control><Alt>Down', '<Super>Tab']
+switch-to-workspace-left=['<Control><Alt>Left', '<Control><Super>Left']
+switch-to-workspace-right=['<Control><Alt>Right', '<Control><Super>Right']

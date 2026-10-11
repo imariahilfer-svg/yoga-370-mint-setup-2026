@@ -1,0 +1,187 @@
+#!/usr/bin/python3
+"""Firewall profiles that follow the network: Home or Public.
+
+Home    the ports in HOME_PORTS are opened, but only on interfaces whose
+        connection was marked as home AND whose router is the one seen when
+        it was marked (so a network that merely copies the name does not count)
+Public  those ports stay closed
+
+  fwprofile event            network changed: back to automatic, re-evaluate
+  fwprofile set auto|home|public
+  fwprofile mark-home        remember the networks connected right now as home
+  fwprofile unmark-home      forget them again
+  fwprofile clear            close the ports (used at boot)
+  fwprofile status           print the state file
+
+Must run as root (the panel indicator starts it through pkexec).
+A manual choice lasts until the next network change.
+"""
+import fcntl
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+import time
+
+# what "Home" opens; KDE Connect uses 1714-1764 on both protocols
+HOME_PORTS = [("1714:1764", "tcp"), ("1714:1764", "udp")]
+IGNORED_TYPES = {"loopback", "bridge", "tun", "veth", "vpn", "wireguard", "dummy"}
+
+TEST = os.geteuid() != 0 and os.environ.get("FWPROFILE_TEST_DIR")
+ETC = TEST or "/etc/fwprofile"
+RUN = TEST or "/run/fwprofile"
+HOME_FILE = os.path.join(ETC, "home.json")      # {uuid: {"name":..., "routers": [mac]}}
+RULES_FILE = os.path.join(ETC, "rules.json")    # ufw rules currently added by us
+STATE_FILE = os.path.join(RUN, "state.json")    # read by the panel indicator
+MODE_FILE = os.path.join(RUN, "mode")
+
+
+def run(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def ufw(*args):
+    if TEST:
+        print("ufw", *args)
+    else:
+        subprocess.run(["ufw", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def router_mac(device, gateway):
+    for _ in range(3):
+        subprocess.run(["ping", "-c1", "-W1", "-I", device, gateway],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for line in run("ip", "neigh", "show", gateway, "dev", device).splitlines():
+            parts = line.split()
+            if "lladdr" in parts:
+                return parts[parts.index("lladdr") + 1].lower()
+        time.sleep(1)
+    return None
+
+
+def networks():
+    """Active connections with the facts needed to judge and to write rules."""
+    found = []
+    out = run("nmcli", "-t", "-e", "no", "-f", "UUID,TYPE,DEVICE,NAME", "connection", "show", "--active")
+    for line in out.splitlines():
+        uuid, ctype, device, name = line.split(":", 3)
+        if ctype.split("-")[-1] in IGNORED_TYPES or ctype in IGNORED_TYPES or not device:
+            continue
+        gateway = run("nmcli", "-g", "IP4.GATEWAY", "device", "show", device).strip()
+        subnet = None
+        for addr in run("ip", "-4", "-o", "addr", "show", "dev", device).split():
+            if "/" in addr:
+                subnet = str(ipaddress.ip_interface(addr).network)
+                break
+        found.append({"uuid": uuid, "name": name, "device": device, "subnet": subnet,
+                      "router": router_mac(device, gateway) if gateway else None})
+    return found
+
+
+def apply(mode):
+    homes = load(HOME_FILE, {})
+    nets = networks()
+    for net in nets:
+        known = homes.get(net["uuid"])
+        net["marked"] = bool(known)
+        net["home"] = bool(known and net["router"] and net["router"] in known["routers"])
+        if mode == "home":
+            net["open"] = bool(net["subnet"])
+        elif mode == "public":
+            net["open"] = False
+        else:
+            net["open"] = net["home"] and bool(net["subnet"])
+
+    wanted = [["in", "on", n["device"], "from", n["subnet"], "to", "any",
+               "port", ports, "proto", proto]
+              for n in nets if n["open"] for ports, proto in HOME_PORTS]
+    current = load(RULES_FILE, [])
+    for rule in current:
+        if rule not in wanted:
+            ufw("--force", "delete", "allow", *rule)
+    for rule in wanted:
+        if rule not in current:
+            ufw("allow", *rule, "comment", "fwprofile home")
+    save(RULES_FILE, wanted)
+
+    with open(MODE_FILE, "w") as f:
+        f.write(mode)
+    os.chmod(MODE_FILE, 0o644)
+    save(STATE_FILE, {
+        "profile": "home" if wanted else "public",
+        "mode": mode,
+        "networks": [{k: n[k] for k in ("name", "device", "marked", "home", "open")} for n in nets],
+        "time": int(time.time()),
+    })
+
+
+def mark(add):
+    homes = load(HOME_FILE, {})
+    for net in networks():
+        if not add:
+            homes.pop(net["uuid"], None)
+        elif net["router"]:
+            entry = homes.setdefault(net["uuid"], {"name": net["name"], "routers": []})
+            entry["name"] = net["name"]
+            if net["router"] not in entry["routers"]:
+                entry["routers"].append(net["router"])
+    save(HOME_FILE, homes)
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    if command == "status":
+        print(json.dumps(load(STATE_FILE, {}), indent=1))
+        return
+    if os.geteuid() != 0 and not TEST:
+        sys.exit("fwprofile must run as root")
+    os.makedirs(ETC, mode=0o755, exist_ok=True)
+    os.makedirs(RUN, mode=0o755, exist_ok=True)
+    lock = open(os.path.join(RUN, "lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+
+    try:
+        with open(MODE_FILE) as f:
+            mode = f.read().strip()
+    except OSError:
+        mode = "auto"
+
+    if command == "event":
+        apply("auto")
+    elif command == "set" and len(sys.argv) == 3 and sys.argv[2] in ("auto", "home", "public"):
+        apply(sys.argv[2])
+    elif command == "mark-home":
+        mark(True)
+        apply("auto")
+    elif command == "unmark-home":
+        mark(False)
+        apply("auto")
+    elif command == "clear":
+        for rule in load(RULES_FILE, []):
+            ufw("--force", "delete", "allow", *rule)
+        save(RULES_FILE, [])
+    elif command == "refresh":
+        apply(mode)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,48 @@
+#!/usr/bin/python3
+"""Open card-menu when an SD card or USB stick is inserted.
+
+Watches udev for removable block devices that gain media and starts
+~/.local/bin/card-menu for each one. Runs from the session autostart.
+"""
+import os
+import subprocess
+
+import pyudev
+
+MENU = os.path.expanduser("~/.local/bin/card-menu")
+
+
+def has_media(dev):
+    try:
+        with open(os.path.join(dev.sys_path, "size")) as f:
+            return int(f.read()) > 0
+    except (OSError, ValueError):
+        return False
+
+
+def is_card_or_stick(dev):
+    if dev.device_type != "disk":
+        return False
+    return dev.sys_name.startswith("mmcblk") or dev.get("ID_BUS") == "usb"
+
+
+def main():
+    context = pyudev.Context()
+    monitor = pyudev.Monitor.from_netlink(context)
+    monitor.filter_by("block")
+    # Media already present at login does not pop up a menu
+    present = {d.device_node for d in context.list_devices(subsystem="block")
+               if is_card_or_stick(d) and has_media(d)}
+    for dev in iter(monitor.poll, None):
+        if not is_card_or_stick(dev):
+            continue
+        node = dev.device_node
+        if dev.action == "remove" or not has_media(dev):
+            present.discard(node)
+        elif node not in present:
+            present.add(node)
+            subprocess.Popen([MENU, node])
+
+
+if __name__ == "__main__":
+    main()
